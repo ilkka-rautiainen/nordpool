@@ -4,8 +4,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from datetime import timezone as ts
 
-# import aiohttp
-# import backoff
+import aiohttp
 from dateutil.parser import parse as parse_dt
 from homeassistant.util import dt as dt_utils
 
@@ -20,6 +19,19 @@ _LOGGER = logging.getLogger(__name__)
 
 class InvalidValueException(ValueError):
     pass
+
+
+class TemporaryPriceError(Exception):
+    """Nord Pool returned a transient HTTP error."""
+
+
+RETRYABLE_PRICE_ERRORS = (
+    InvalidValueException,
+    TemporaryPriceError,
+    aiohttp.ClientConnectionError,
+    aiohttp.ClientPayloadError,
+    TimeoutError,
+)
 
 
 class CurrencyMismatch(ValueError):  # pylint: disable=missing-class-docstring
@@ -106,13 +118,16 @@ class AioPrices:
         self.currency = currency
 
     async def _io(self, url, **kwargs):
-        resp = await self.client.get(url, params=kwargs)
-        _LOGGER.debug("requested %s %s", resp.url, kwargs)
+        async with self.client.get(url, params=kwargs) as resp:
+            _LOGGER.debug("requested %s %s", resp.url, kwargs)
 
-        if resp.status == 204:
-            return None
+            if resp.status == 204:
+                return None
+            if resp.status == 429 or resp.status >= 500:
+                raise TemporaryPriceError(f"Nord Pool returned HTTP {resp.status}")
 
-        return await resp.json()
+            resp.raise_for_status()
+            return await resp.json()
 
     def _parse_dt(self, time_str):
         """Parse datetimes to UTC from Stockholm time, which Nord Pool uses."""

@@ -20,6 +20,7 @@ from homeassistant.components.sensor.const import (
 from homeassistant.components.sensor import SensorEntity
 from jinja2 import pass_context
 
+from .aio_price import RETRYABLE_PRICE_ERRORS
 from .const import (
     DOMAIN,
     EVENT_NEW_DAY,
@@ -426,67 +427,72 @@ class NordpoolSensor(SensorEntity):
         # this should be checked a better way
         return len([i for i in self.tomorrow if i not in (None, float("inf"))]) >= 23
 
-    async def _update_current_price(self) -> None:
-        """update the current price (price this hour)"""
-        local_now = dt_utils.now()
+    def _update_current_price(self, now) -> None:
+        """Use the price whose interval contains the current time."""
+        self._current_price = next(
+            (
+                item["value"]
+                for item in self._someday(self._data_today)
+                if item["start"] <= now < item["end"]
+            ),
+            None,
+        )
 
-        data = await self._api.today(self._area, self._currency)
-        if data:
-            for item in self._someday(data):
-                if item["start"] <= local_now < item["end"]:
-                    self._current_price = item["value"]
-                    _LOGGER.debug(
-                        "Updated %s _current_price %s", self.name, item["value"]
-                    )
-        else:
-            _LOGGER.debug("Cant update _update_current_price because it was no data")
+    @property
+    def available(self) -> bool:
+        """Only publish a price when the current interval is known."""
+        return self._current_price is not None
 
     async def handle_new_day(self):
-        """Update attrs for the new day"""
-        _LOGGER.debug("handle_new_day")
-        self._data_tomorrow = None
-        # update attrs for the new day
+        """Clear yesterday's attributes and load the prices for the new day."""
+        self._data_today = SENTINEL
+        self._data_tomorrow = SENTINEL
         await self.handle_new_hr()
 
-    async def handle_new_hr(self):
-        """Update attrs for the new hour"""
-        _LOGGER.debug("handle_new_hr")
-        today = await self._api.today(self._area, self._currency)
-        if today:
-            self._data_today = today
+    async def handle_new_hr(self, *, fetch_tomorrow=True, refresh_tomorrow=False):
+        """Update the sensor, allowing the next signal to retry temporary failures."""
+        try:
+            self._data_today = await self._api.today(self._area, self._currency)
+        except RETRYABLE_PRICE_ERRORS as err:
+            _LOGGER.debug("Could not fetch today's prices for %s: %s", self.name, err)
 
         now = dt_utils.now()
-        if self._data_tomorrow is SENTINEL and stock(now) >= stock(now).replace(
-            hour=13, minute=RANDOM_MINUTE, second=RANDOM_SECOND
+        stockholm_now = stock(now)
+        if refresh_tomorrow or (
+            fetch_tomorrow
+            and self._data_tomorrow is SENTINEL
+            and stockholm_now >= stockholm_now.replace(
+                hour=13, minute=RANDOM_MINUTE, second=RANDOM_SECOND
+            )
         ):
-            tomorrow = await self._api.tomorrow(self._area, self._currency)
-            if tomorrow:
-                self._data_tomorrow = tomorrow
+            try:
+                self._data_tomorrow = await self._api.tomorrow(
+                    self._area, self._currency
+                )
+            except RETRYABLE_PRICE_ERRORS as err:
+                _LOGGER.debug(
+                    "Could not fetch tomorrow's prices for %s: %s", self.name, err
+                )
 
+        # An update already in flight can finish after this entity is removed.
+        if self.hass is None:
+            return
         self._update()
-        # Updates the current for this hour.
-        await self._update_current_price()
-        # This is not to make sure the correct template costs are set. Issue 258
+        self._update_current_price(dt_utils.now())
         self._attr_native_value = self.current_price
         self.async_write_ha_state()
 
     async def handle_new_price(self):
-        """Update atts because of the new prices"""
-        _LOGGER.debug("handle_new_price")
-        tomorrow = await self._api.tomorrow(self._area, self._currency)
-        if tomorrow:
-            self._data_tomorrow = tomorrow
-
-        await self.handle_new_hr()
+        """Read the newly published prices as well as the current price."""
+        await self.handle_new_hr(refresh_tomorrow=True)
 
     async def async_added_to_hass(self):
-        """Connect to dispatcher listening for entity data notifications."""
+        """Subscribe to price changes for the lifetime of this entity."""
         await super().async_added_to_hass()
-        _LOGGER.debug("called async_added_to_hass %s", self.name)
-
-        async_dispatcher_connect(self._api._hass, EVENT_NEW_DAY, self.handle_new_day)
-        async_dispatcher_connect(
-            self._api._hass, EVENT_NEW_PRICE, self.handle_new_price
-        )
-        async_dispatcher_connect(self._api._hass, EVENT_NEW_HOUR, self.handle_new_hr)
-        await self.handle_new_hr()
+        for signal, handler in (
+            (EVENT_NEW_DAY, self.handle_new_day),
+            (EVENT_NEW_PRICE, self.handle_new_price),
+            (EVENT_NEW_HOUR, self.handle_new_hr),
+        ):
+            self.async_on_remove(async_dispatcher_connect(self.hass, signal, handler))
+        await self.handle_new_hr(fetch_tomorrow=False)
